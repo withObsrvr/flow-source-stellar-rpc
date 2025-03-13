@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -24,6 +25,7 @@ type RPCLedgerSource struct {
 	apiKey        string
 	pollInterval  time.Duration
 	currentLedger uint32
+	format        string // Format to use when retrieving ledgers: "base64" or "json"
 	stopCh        chan struct{}
 	wg            sync.WaitGroup
 }
@@ -61,6 +63,17 @@ func (src *RPCLedgerSource) Initialize(config map[string]interface{}) error {
 	if startLedger, ok := config["start_ledger"].(float64); ok {
 		src.currentLedger = uint32(startLedger)
 	}
+
+	// Set format if specified, default to "base64"
+	src.format = "base64"
+	if format, ok := config["format"].(string); ok {
+		if format == "json" || format == "base64" {
+			src.format = format
+		} else {
+			log.Printf("Warning: Invalid format '%s', using default 'base64'", format)
+		}
+	}
+	log.Printf("Using format: %s", src.format)
 
 	src.stopCh = make(chan struct{})
 
@@ -175,8 +188,8 @@ func (src *RPCLedgerSource) fetchAndProcessLedger(ctx context.Context) error {
 		Pagination: &protocol.LedgerPaginationOptions{
 			Limit: 1,
 		},
-		// Request base64 format for the XDR data
-		Format: "base64",
+		// Use the format specified in the config
+		Format: src.format,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to fetch ledger %d: %w", src.currentLedger, err)
@@ -197,25 +210,96 @@ func (src *RPCLedgerSource) fetchAndProcessLedger(ctx context.Context) error {
 
 	log.Printf("Processing ledger %d with hash %s", ledger.Sequence, ledger.Hash)
 
-	// Try to convert the ledger to XDR format
-	ledgerXDR, err := src.convertToXDR(ledger)
-	if err != nil {
-		log.Printf("Warning: Could not convert ledger to XDR format: %v", err)
-		// If we can't convert to XDR, we can't send to contract-events processor
-		return fmt.Errorf("failed to convert ledger to XDR format: %w", err)
+	var payload interface{}
+	var format string
+
+	// Process based on the configured format
+	if src.format == "base64" {
+		// Try to convert the ledger to XDR format
+		ledgerXDR, err := src.convertToXDR(ledger)
+		if err != nil {
+			log.Printf("Warning: Could not convert ledger to XDR format: %v", err)
+			// If we can't convert to XDR, we can't send to contract-events processor
+			return fmt.Errorf("failed to convert ledger to XDR format: %w", err)
+		}
+		// Dereference the pointer to get the actual LedgerCloseMeta value
+		payload = *ledgerXDR
+		format = "xdr"
+		log.Printf("Using XDR format for ledger %d", ledger.Sequence)
+	} else {
+		// Using JSON format
+		// Check if we have JSON metadata directly
+		if ledger.LedgerMetadataJSON != nil && len(ledger.LedgerMetadataJSON) > 0 {
+			// Parse the JSON metadata
+			var parsedMetadata map[string]interface{}
+			if err := json.Unmarshal(ledger.LedgerMetadataJSON, &parsedMetadata); err != nil {
+				log.Printf("Error parsing JSON metadata: %v", err)
+				// Fall back to raw metadata
+				payload = ledger.LedgerMetadataJSON
+				format = "raw_json"
+			} else {
+				// Successfully parsed JSON metadata
+				payload = parsedMetadata
+				format = "json"
+				log.Printf("Using parsed JSON metadata for ledger %d", ledger.Sequence)
+			}
+		} else if ledger.LedgerMetadata != "" {
+			// Try to parse the metadata as JSON
+			var parsedMetadata map[string]interface{}
+			if err := json.Unmarshal([]byte(ledger.LedgerMetadata), &parsedMetadata); err != nil {
+				log.Printf("Error parsing ledger metadata as JSON: %v", err)
+				// Fall back to raw metadata
+				payload = []byte(ledger.LedgerMetadata)
+				format = "raw"
+			} else {
+				// Successfully parsed JSON
+				payload = parsedMetadata
+				format = "json"
+				log.Printf("Using parsed JSON from metadata for ledger %d", ledger.Sequence)
+			}
+		} else {
+			// No metadata available
+			log.Printf("No metadata available for ledger %d", ledger.Sequence)
+			payload = map[string]interface{}{} // Empty map
+			format = "empty"
+		}
+
+		// For JSON format, create a properly formatted contract events structure
+		// that processors like contract-events can understand
+		contractEvents := map[string]interface{}{
+			"ledger_sequence": ledger.Sequence,
+			"ledger_hash":     ledger.Hash,
+			"events":          []interface{}{}, // Empty events array by default
+		}
+
+		// If we have parsed metadata, try to extract events
+		if metadataMap, ok := payload.(map[string]interface{}); ok {
+			// Try to extract events from the metadata
+			// The exact path to events depends on the structure of the metadata
+			if txs, ok := metadataMap["transactions"].([]interface{}); ok {
+				for _, tx := range txs {
+					if txMap, ok := tx.(map[string]interface{}); ok {
+						if events, ok := txMap["events"].([]interface{}); ok {
+							contractEvents["events"] = append(contractEvents["events"].([]interface{}), events...)
+						}
+					}
+				}
+			}
+		}
+
+		// Use the formatted contract events as payload
+		payload = contractEvents
+		log.Printf("Created formatted contract events structure for ledger %d", ledger.Sequence)
 	}
 
-	// Create message with the XDR ledger as payload
-	// Dereference the pointer to get the actual LedgerCloseMeta value
-	// The contract-events processor expects xdr.LedgerCloseMeta, not *xdr.LedgerCloseMeta
 	msg := pluginapi.Message{
-		Payload:   *ledgerXDR, // Dereference the pointer
+		Payload:   payload,
 		Timestamp: time.Unix(ledger.LedgerCloseTime, 0),
 		Metadata: map[string]interface{}{
 			"ledger_sequence": ledger.Sequence,
 			"ledger_hash":     ledger.Hash,
 			"source":          "stellar-rpc",
-			"format":          "xdr",
+			"format":          format,
 		},
 	}
 
@@ -316,7 +400,8 @@ func (src *RPCLedgerSource) Close() error {
 
 func New() pluginapi.Plugin {
 	return &RPCLedgerSource{
-		pollInterval: 3 * time.Second,
+		pollInterval: 5 * time.Second,
+		format:       "base64", // Default format
 		stopCh:       make(chan struct{}),
 	}
 }
