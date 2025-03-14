@@ -400,7 +400,7 @@ func (src *RPCLedgerSource) Close() error {
 
 func New() pluginapi.Plugin {
 	return &RPCLedgerSource{
-		pollInterval: 5 * time.Second,
+		pollInterval: 1 * time.Second,
 		format:       "base64", // Default format
 		stopCh:       make(chan struct{}),
 	}
